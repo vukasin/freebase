@@ -2,11 +2,11 @@ import logging
 import tornado
 
 import tornado.ioloop as io
+from src import freebase
 
 ioloop = io.IOLoop.instance()
 
 __author__ = 'vukasin'
-import freebase
 logging.basicConfig(level=logging.DEBUG)
 
 @tornado.gen.engine
