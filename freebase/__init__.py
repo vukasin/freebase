@@ -4,6 +4,10 @@ import rdflib
 import urllib.request
 import urllib.parse
 import logging
+import tornado
+import tornado.httpclient
+
+from tornado import gen
 
 __author__ = 'vukasin'
 
@@ -27,17 +31,19 @@ class Reference(object):
         self.name = name
         self.type = type
 
-    def get_rdf(self, ns='http://rdf.freebase.com'):
+    def get_rdf(self, ns='http://rdf.freebase.com#'):
         id = rdflib.URIRef(ns + self.id)
         for t in self.type:
             yield (id, rdflib.RDF.type, rdflib.URIRef(ns + t))
         if self.name is not None:
             yield (id, rdflib.RDFS.label, rdflib.Literal(self.name))
 
-    def load(self, *properties):
+    @gen.engine
+    def load(self, callback, *properties):
         if len(properties) == 0:
             properties = ["*"]
-        return self.freebase.load_object(self.id, *properties)
+        res = yield Task(self.freebase.load_object, self.id, *properties)
+        callback(res)
 
 
 class Object(object):
@@ -71,22 +77,27 @@ class Object(object):
         else:
             yield (subj, pred, rdflib.Literal(obj))
 
-    @property
-    def property_names(self):
+    @gen.engine
+    def property_names(self, callback):
         if not self.__properties:
             props = set()
             for t in self.type:
-                type_obj = self.freebase.load_type(t)
+                type_obj = yield gen.Task(self.freebase.load_type, type_id=t)
                 for prop in type_obj.properties['/type/type/properties']:
                     props.add(prop.id)
             self.__properties = props
-        return self.__properties
+        callback(self.__properties)
 
-    def load(self, *properties):
-        self.__load_data(self.freebase.load_properties(self.id, *properties))
+    @gen.engine
+    def load(self, callback, properties):
+        properties = yield gen.Task(self.freebase.load_properties, id=self.id, properties=properties)
+        callback(self.__load_data(properties))
 
-    def load_all(self):
-        self.load(*self.property_names)
+    @gen.engine
+    def load_all(self, callback):
+        prop_names = yield gen.Task(self.property_names)
+        res = yield gen.Task(self.load, properties=prop_names)
+        callback(res)
 
     def __load_data(self, data: dict):
         def load_value(v):
@@ -100,6 +111,7 @@ class Object(object):
                 return [load_value(e) for e in v]
             else:
                 return v
+
         for p, v in data.items():
             if p == 'type':
                 self.type.extend(v)
@@ -143,7 +155,7 @@ class Freebase(object):
         self.api_key = api_key
         self.base_url = base_url
         self.params = params
-
+        self.http_client = tornado.httpclient.AsyncHTTPClient()
 
     def __fb2py(self, fb, obj):
         """
@@ -161,7 +173,8 @@ class Freebase(object):
         else:
             return obj
 
-    def load_properties(self, id: str, *_properties) -> dict:
+    @gen.engine
+    def load_properties(self, callback, id: str, properties):
         """
 
         :rtype : dict
@@ -171,29 +184,35 @@ class Freebase(object):
         """
         if id in self.__cache:
             logging.debug("Using cached copy for %r", id)
-            return self.__cache[id]
-        q = dict()
-        properties = list(_properties)
-        properties.sort()
-        for offset in range(0, len(properties), 16):
-            qtemp = [("id", id)] + [("type", [])] + [(properties[i], [{}]) for i in range(offset, min(offset + 16, len(properties)))]
-            query = dict(qtemp)
-            tmp = self.mql(query=query)
-            q.update(tmp)
-        if not self.__cache is None:
-            self.__cache[id] = q
-        return q
+            callback(self.__cache[id])
+        else:
+            q = dict()
+            properties = list(properties)
+            properties.sort()
+            for offset in range(0, len(properties), 16):
+                qtemp = [("id", id)] + [("type", [])] + [(properties[i], [{}]) for i in
+                                                         range(offset, min(offset + 16, len(properties)))]
+                query = dict(qtemp)
+                tmp = yield gen.Task(self.mql, query=query)
+                q.update(tmp)
+            if not self.__cache is None:
+                self.__cache[id] = q
+            callback(q)
 
-    def load_object(self, id: str, *properties) -> Object:
+    @gen.engine
+    def load_object(self, callback, id: str, properties):
         """
         :rtype : Object
         :param id:
         :param properties:
         :param params:
         """
-        return self.__fb2py(self, self.load_properties(id, *properties))
+        props = yield gen.Task(self.load_properties,
+                               id=id, properties=properties)
+        callback(self.__fb2py(self, props))
 
-    def load_type(self, type_id) -> Object:
+    @gen.engine
+    def load_type(self, callback, type_id):
         """
         fetches basic information about a freebase type
 
@@ -201,11 +220,16 @@ class Freebase(object):
         :return: a representation of the type
         :type type_id: str
         """
-        return self.__fb2py(self, self.load_properties(type_id,
-                                                        "/type/type/properties",
-                                                        "/type/type/domain",
-                                                        "/type/type/expected_by",
-                                                        "/type/type/default_property"))
+        props = yield gen.Task(self.load_properties,
+                               id=type_id,
+                               properties=[
+                                   "/type/type/properties",
+                                   "/type/type/domain",
+                                   "/type/type/expected_by",
+                                   "/type/type/default_property"
+                               ])
+
+        callback(self.__fb2py(self, props))
 
     def create_request_url(self, service_url, **additional_params) -> str:
         """
@@ -221,18 +245,22 @@ class Freebase(object):
         logging.debug("Call Freebase API %r", params)
         return self.base_url + service_url + '?' + urllib.parse.urlencode(params)
 
-    def request(self, service_url, **params):
+    @gen.engine
+    def request(self, callback, service_url, **params):
         """
 
         :param service_url:
         :param params:
+        :callback
         :return:
         """
         url = self.create_request_url(service_url, **params)
-        response = json.loads(urllib.request.urlopen(url).read().decode('utf-8'))
-        return response['result']
+        logging.debug("fetch %s", url)
+        response = yield gen.Task(self.http_client.fetch, url)
+        callback(json.loads(response.body.decode('utf-8'))['result'])
 
-    def mql(self, query):
+    @gen.engine
+    def mql(self, callback, query):
         """
 
         :param query:
@@ -241,20 +269,22 @@ class Freebase(object):
         :return:
         """
         logging.debug("Running MQL %r", query)
-        res = dict(self.request("mqlread", query=json.dumps(query)))
+        response = yield gen.Task(self.request, service_url="mqlread", query=json.dumps(query))
+        res = dict(response)
         final = []
         for k, v in res.items():
             final.append((k, v))
-        return dict(final)
+        callback(dict(final))
 
-    def search(self, query):
+    @gen.engine
+    def search(self, callback, query):
         """
 
         :param query:
         :param filter:
         :param params:
         """
-        return self.request(service_url='search', query=query)
+        callback(self.request, service_url='search', query=query)
 
 
 
