@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 @tornado.gen.engine
 def d(callback):
-    api_key = "AIzaSyAyg3M0vKzhc08TP8ehjlgzIUZhfpUbLtU"
+    api_key = "YOUR API KEY"
 
     logging.debug("create freebase object")
     fb = freebase.Freebase(api_key, cache_path="freebase_cache")
